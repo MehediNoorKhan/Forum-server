@@ -2,14 +2,80 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { MongoClient } = require("mongodb");
+const admin = require("firebase-admin");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// ----------------- Firebase Admin -----------------
+const serviceAccount = require("./service_key.json");
+
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+});
+
+// Middleware to verify Firebase token
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ message: "Unauthorized: No token provided" });
+    }
+
+    const token = authHeader.split(" ")[1];
+    try {
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        req.user = decodedToken; // attach user info
+        next();
+    } catch (err) {
+        console.error("Firebase token error:", err);
+        return res.status(401).json({ message: "Unauthorized: Invalid token" });
+    }
+};
+
+const verifyAdmin = async (req, res, next) => {
+    if (!req.user?.email) {
+        return res.status(401).json({ message: "Unauthorized: No user email" });
+    }
+
+    try {
+        const user = await usersCollection.findOne({ email: req.user.email });
+        if (!user || user.role !== "admin") {
+            // Forbidden, frontend can redirect to /forbidden
+            return res.status(403).json({ message: "Forbidden: Admins only" });
+        }
+        next();
+    } catch (err) {
+        console.error("Admin verification failed:", err);
+        res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+const verifyUser = async (req, res, next) => {
+    if (!req.user?.email) {
+        return res.status(401).json({ message: "Unauthorized: No user email" });
+    }
+
+    try {
+        const user = await usersCollection.findOne({ email: req.user.email });
+
+        if (!user || user.role !== "user") {
+            // Forbidden: only users with role 'user' allowed
+            return res.status(403).json({ message: "Forbidden: Users only" });
+        }
+
+        next(); // user verified
+    } catch (err) {
+        console.error("User verification failed:", err);
+        res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+
+// ----------------- Express Middlewares -----------------
 app.use(cors());
 app.use(express.json());
 
-
+// ----------------- MongoDB Setup -----------------
 async function startServer() {
     try {
         const client = new MongoClient(process.env.MONGO_URI);
@@ -29,15 +95,19 @@ async function startServer() {
             "code", "refresh", "errors", "time", "loop", "beautiful",
             "quick", "slow", "crash", "render"
         ];
+
         const count = await tagsCollection.countDocuments();
         if (count === 0) {
             await tagsCollection.insertMany(defaultTags.map(name => ({ name })));
             console.log("✅ Default tags inserted");
         }
 
-        // ------------------ ROUTES ------------------
+        // ----------------- Routes -----------------
 
-        // Get all tags
+        // Root
+        app.get("/", (req, res) => res.send("Server is running!"));
+
+        // Get all tags (public)
         app.get("/tags", async (req, res) => {
             try {
                 const tags = await tagsCollection.find().toArray();
@@ -48,7 +118,7 @@ async function startServer() {
             }
         });
 
-        // Insert new user
+        // Create user (public)
         app.post("/users", async (req, res) => {
             const { name, email, avatar, role, membership = "no", userStatus = "bronze" } = req.body;
             if (!name || !email || !avatar) {
@@ -68,13 +138,32 @@ async function startServer() {
             }
         });
 
+        // Get user by email (protected)
+        app.get("/users/email/:email", verifyToken, async (req, res) => {
+            const { email } = req.params;
 
-        // POST /posts - add a new post
-        app.post("/posts", async (req, res) => {
+            // Only allow access if token email matches
+            if (req.user.email !== email) {
+                return res.status(403).json({ message: "Forbidden" });
+            }
+
+            const user = await usersCollection.findOne({ email });
+            if (!user) return res.status(404).json({ message: "User not found" });
+
+            res.json(user);
+        });
+
+        // Add post (protected)
+        app.post("/posts", verifyToken, async (req, res) => {
             const post = req.body;
 
             if (!post.authorEmail || !post.authorName || !post.postTitle || !post.postDescription || !post.tag) {
                 return res.status(400).json({ message: "Missing required fields" });
+            }
+
+            // Ensure user cannot post as another user
+            if (req.user.email !== post.authorEmail) {
+                return res.status(403).json({ message: "Forbidden: Cannot post as another user" });
             }
 
             const newPost = {
@@ -90,19 +179,12 @@ async function startServer() {
             };
 
             try {
-                // Insert the post
                 const result = await postsCollection.insertOne(newPost);
-
-                // Increment the user's posts count
-                const userUpdate = await usersCollection.updateOne(
-                    { email: post.authorEmail },
-                    { $inc: { posts: 1 } }
-                );
+                await usersCollection.updateOne({ email: post.authorEmail }, { $inc: { posts: 1 } });
 
                 res.status(201).json({
                     message: "Post added successfully",
                     post: result,
-                    userUpdated: userUpdate.modifiedCount
                 });
             } catch (err) {
                 console.error(err);
@@ -110,52 +192,40 @@ async function startServer() {
             }
         });
 
-        app.get("/users/email/:email", async (req, res) => {
-            const { email } = req.params;
-            const user = await usersCollection.findOne({ email });
-            if (!user) return res.status(404).json({ message: "User not found" });
-            res.json(user);
-        });
+        // Add announcement (protected)
+        app.post("/announcements", verifyToken, async (req, res) => {
+            const announcement = req.body;
 
-        // POST /announcements - add a new announcement
-        app.post("/announcements", async (req, res) => {
+            if (!announcement.authorName || !announcement.authorEmail || !announcement.title || !announcement.description) {
+                return res.status(400).json({ message: "Missing required fields" });
+            }
+
+            // Only allow user to post as themselves
+            if (req.user.email !== announcement.authorEmail) {
+                return res.status(403).json({ message: "Forbidden: Cannot announce as another user" });
+            }
+
+            const newAnnouncement = {
+                authorName: announcement.authorName,
+                authorEmail: announcement.authorEmail,
+                authorImage: announcement.authorImage || "",
+                title: announcement.title,
+                description: announcement.description,
+                creation_time: announcement.creation_time || new Date(),
+            };
+
             try {
-                const announcement = req.body;
-
-                // Validate required fields
-                if (!announcement.authorName || !announcement.authorEmail || !announcement.title || !announcement.description) {
-                    return res.status(400).json({ message: "Missing required fields" });
-                }
-
-                const newAnnouncement = {
-                    authorName: announcement.authorName,
-                    authorEmail: announcement.authorEmail,
-                    authorImage: announcement.authorImage || "", // default empty string if not uploaded
-                    title: announcement.title,
-                    description: announcement.description,
-                    creation_time: announcement.creation_time || new Date(),
-                };
-
                 const result = await announcementsCollection.insertOne(newAnnouncement);
-
-                res.status(201).json({
-                    message: "Announcement added successfully",
-                    data: result,
-                });
+                res.status(201).json({ message: "Announcement added successfully", data: result });
             } catch (err) {
-                console.error("Error adding announcement:", err);
+                console.error(err);
                 res.status(500).json({ message: "Failed to add announcement" });
             }
         });
 
-
-
-
-
-        // Root
-        app.get("/", (req, res) => res.send("Server is running!"));
-
+        // ----------------- Start Server -----------------
         app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
     } catch (err) {
         console.error("MongoDB error:", err);
     }
