@@ -9,7 +9,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-let usersCollection, tagsCollection;
 
 async function startServer() {
     try {
@@ -17,9 +16,10 @@ async function startServer() {
         await client.connect();
         const db = client.db(process.env.DB_NAME);
 
-        usersCollection = db.collection("users");
-        tagsCollection = db.collection("tags");
-        postsCollection = db.collection("posts");
+        const usersCollection = db.collection("users");
+        const tagsCollection = db.collection("tags");
+        const postsCollection = db.collection("posts");
+        const announcementsCollection = db.collection("announcements");
 
         console.log("✅ MongoDB Connected");
 
@@ -50,7 +50,7 @@ async function startServer() {
 
         // Insert new user
         app.post("/users", async (req, res) => {
-            const { name, email, avatar, membership = "no", userStatus = "bronze" } = req.body;
+            const { name, email, avatar, role, membership = "no", userStatus = "bronze" } = req.body;
             if (!name || !email || !avatar) {
                 return res.status(400).json({ message: "Missing required fields" });
             }
@@ -59,7 +59,7 @@ async function startServer() {
                 const existingUser = await usersCollection.findOne({ email });
                 if (existingUser) return res.status(409).json({ message: "User already exists" });
 
-                const newUser = { name, email, avatar, membership, userStatus, posts: 0 };
+                const newUser = { name, email, avatar, role, membership, userStatus, posts: 0 };
                 const result = await usersCollection.insertOne(newUser);
                 res.status(201).json({ message: "User created successfully", data: result });
             } catch (err) {
@@ -116,6 +116,39 @@ async function startServer() {
             if (!user) return res.status(404).json({ message: "User not found" });
             res.json(user);
         });
+
+        // POST /announcements - add a new announcement
+        app.post("/announcements", async (req, res) => {
+            try {
+                const announcement = req.body;
+
+                // Validate required fields
+                if (!announcement.authorName || !announcement.authorEmail || !announcement.title || !announcement.description) {
+                    return res.status(400).json({ message: "Missing required fields" });
+                }
+
+                const newAnnouncement = {
+                    authorName: announcement.authorName,
+                    authorEmail: announcement.authorEmail,
+                    authorImage: announcement.authorImage || "", // default empty string if not uploaded
+                    title: announcement.title,
+                    description: announcement.description,
+                    creation_time: announcement.creation_time || new Date(),
+                };
+
+                const result = await announcementsCollection.insertOne(newAnnouncement);
+
+                res.status(201).json({
+                    message: "Announcement added successfully",
+                    data: result,
+                });
+            } catch (err) {
+                console.error("Error adding announcement:", err);
+                res.status(500).json({ message: "Failed to add announcement" });
+            }
+        });
+
+
 
 
 
