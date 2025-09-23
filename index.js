@@ -51,6 +51,7 @@ async function startServer() {
         const tagsCollection = db.collection("tags");
         const postsCollection = db.collection("posts");
         const announcementsCollection = db.collection("announcements");
+        const commentsCollection = db.collection("comments");
 
         console.log("✅ MongoDB Connected");
 
@@ -167,11 +168,19 @@ async function startServer() {
 
                 const pipeline = [
                     {
+                        $lookup: {
+                            from: "comments",
+                            localField: "_id",
+                            foreignField: "postId",
+                            as: "comments"
+                        }
+                    },
+                    {
                         $addFields: {
                             upvoteBy: { $ifNull: ["$upvoteBy", []] },
                             downvoteBy: { $ifNull: ["$downvoteBy", []] },
+                            commentsCount: { $size: "$comments" },
                             popularityScore: { $subtract: [{ $size: { $ifNull: ["$upvoteBy", []] } }, { $size: { $ifNull: ["$downvoteBy", []] } }] },
-                            commentsCount: { $size: { $ifNull: ["$comments", []] } }
                         }
                     },
                     { $sort: sortQuery },
@@ -194,22 +203,51 @@ async function startServer() {
             }
         });
 
-        // Get single post by id
+
+        // Get single post with comments
         app.get("/posts/:id", async (req, res) => {
             try {
                 const post = await postsCollection.findOne({ _id: new ObjectId(req.params.id) });
                 if (!post) return res.status(404).json({ message: "Post not found" });
-                res.json(post);
+
+                const comments = await commentsCollection
+                    .find({ postId: req.params.id })
+                    .sort({ createdAt: -1 })
+                    .toArray();
+
+                res.json({ post, comments });
             } catch (err) {
-                console.error(err);
-                res.status(500).json({ message: "Failed to fetch post" });
+                res.status(500).json({ message: err.message });
             }
         });
 
-        // Vote on post
-        // Vote on post - improved
+        app.post("/posts/:id/comment", verifyToken, async (req, res) => {
+            const { comment } = req.body;
+            const postId = req.params.id;
+
+            const post = await postsCollection.findOne({ _id: new ObjectId(postId) });
+            if (!post) return res.status(404).json({ message: "Post not found" });
+
+            const newComment = {
+                postId,
+                postTitle: post.postTitle,
+                comment,
+                commenterName: req.user.name || "Unknown",
+                commenterEmail: req.user.email,
+                commenterImage: req.user.picture || "",
+                createdAt: new Date(),
+            };
+
+            await commentsCollection.insertOne(newComment);
+
+            // Count updated comments
+            const commentsCount = await commentsCollection.countDocuments({ postId });
+
+            res.status(201).json({ ...newComment, commentsCount });
+        });
+
+
         app.patch("/posts/:id/vote", verifyToken, async (req, res) => {
-            const { id } = req.params;
             const { type } = req.body;
             const userEmail = req.user.email;
 
@@ -218,55 +256,42 @@ async function startServer() {
             }
 
             try {
-                const post = await postsCollection.findOne({ _id: new ObjectId(id) });
+                const postId = new ObjectId(req.params.id);
+                const post = await postsCollection.findOne({ _id: postId });
                 if (!post) return res.status(404).json({ message: "Post not found" });
 
-                if (!post.upvoteBy) post.upvoteBy = [];
-                if (!post.downvoteBy) post.downvoteBy = [];
-
-                const isUpvoted = post.upvoteBy.includes(userEmail);
-                const isDownvoted = post.downvoteBy.includes(userEmail);
-
-                let updatedUpvoteBy = [...post.upvoteBy];
-                let updatedDownvoteBy = [...post.downvoteBy];
+                let upvoteBy = post.upvoteBy || [];
+                let downvoteBy = post.downvoteBy || [];
 
                 if (type === "upvote") {
-                    if (isUpvoted) {
-                        // Remove upvote (toggle off)
-                        updatedUpvoteBy = updatedUpvoteBy.filter(email => email !== userEmail);
-                    } else {
-                        // Add upvote, remove from downvote if present
-                        updatedUpvoteBy.push(userEmail);
-                        updatedDownvoteBy = updatedDownvoteBy.filter(email => email !== userEmail);
+                    if (upvoteBy.includes(userEmail)) upvoteBy = upvoteBy.filter(e => e !== userEmail); // toggle off
+                    else {
+                        upvoteBy.push(userEmail);
+                        downvoteBy = downvoteBy.filter(e => e !== userEmail);
                     }
-                } else if (type === "downvote") {
-                    if (isDownvoted) {
-                        // Remove downvote (toggle off)
-                        updatedDownvoteBy = updatedDownvoteBy.filter(email => email !== userEmail);
-                    } else {
-                        // Add downvote, remove from upvote if present
-                        updatedDownvoteBy.push(userEmail);
-                        updatedUpvoteBy = updatedUpvoteBy.filter(email => email !== userEmail);
+                } else {
+                    if (downvoteBy.includes(userEmail)) downvoteBy = downvoteBy.filter(e => e !== userEmail); // toggle off
+                    else {
+                        downvoteBy.push(userEmail);
+                        upvoteBy = upvoteBy.filter(e => e !== userEmail);
                     }
                 }
 
                 const updatedPost = await postsCollection.findOneAndUpdate(
-                    { _id: new ObjectId(id) },
-                    {
-                        $set: {
-                            upvoteBy: updatedUpvoteBy,
-                            downvoteBy: updatedDownvoteBy,
-                        },
-                    },
+                    { _id: postId },
+                    { $set: { upvoteBy, downvoteBy } },
                     { returnDocument: "after" }
                 );
 
-                res.json(updatedPost.value);
+                res.json(updatedPost.value); // return full post with actual arrays
             } catch (err) {
                 console.error("Vote error:", err);
                 res.status(500).json({ message: "Internal server error" });
             }
         });
+
+
+
 
 
         // ----------------- Announcements -----------------
@@ -294,6 +319,57 @@ async function startServer() {
                 res.status(500).json({ message: "Failed to add announcement" });
             }
         });
+
+        // GET all announcements
+        app.get("/announcements", async (req, res) => {
+            try {
+                const announcements = await announcementsCollection
+                    .find({})
+                    .sort({ creation_time: -1 }) // newest first
+                    .toArray();
+
+                res.status(200).json({
+                    announcements: announcements,
+                    count: announcements.length,
+                });
+            } catch (err) {
+                console.error("Failed to fetch announcements:", err);
+                res.status(500).json({ message: "Failed to fetch announcements" });
+            }
+        });
+
+        // ✅ Get unseen announcements count
+        app.get("/announcements/unseen/count", verifyToken, async (req, res) => {
+            try {
+                const email = req.user.email;
+
+                // Find announcements the user hasn't seen yet
+                const unseenCount = await announcementsCollection.countDocuments({
+                    seenBy: { $ne: email }
+                });
+
+                res.json({ count: unseenCount });
+            } catch (err) {
+                console.error("Error fetching unseen announcements:", err);
+                res.status(500).json({ message: "Failed to fetch unseen count" });
+            }
+        });
+
+        // ✅ Mark all announcements as seen (optional, call this when user opens announcements page)
+        app.patch("/announcements/mark-seen", verifyToken, async (req, res) => {
+            try {
+                const email = req.user.email;
+                await announcementsCollection.updateMany(
+                    { seenBy: { $ne: email } },
+                    { $push: { seenBy: email } }
+                );
+                res.json({ message: "Marked all announcements as seen" });
+            } catch (err) {
+                console.error("Error marking announcements:", err);
+                res.status(500).json({ message: "Failed to mark as seen" });
+            }
+        });
+
 
         // ----------------- Start Server -----------------
         app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
