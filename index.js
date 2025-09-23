@@ -40,6 +40,55 @@ const verifyToken = async (req, res, next) => {
     }
 };
 
+// Verify normal user
+const verifyUser = async (req, res, next) => {
+    try {
+        const email = req.user.email;
+        if (!email) {
+            return res.status(403).json({ message: "Forbidden: No email found in token" });
+        }
+
+        const user = await usersCollection.findOne({ email: email });
+        if (!user) {
+            return res.status(403).json({ message: "Forbidden: User not found" });
+        }
+
+        if (user.role !== "user") {
+            return res.status(403).json({ message: "Forbidden: Not a user" });
+        }
+
+        next();
+    } catch (err) {
+        console.error("verifyUser error:", err);
+        return res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+// Verify admin
+const verifyAdmin = async (req, res, next) => {
+    try {
+        const email = req.user.email;
+        if (!email) {
+            return res.status(403).json({ message: "Forbidden: No email found in token" });
+        }
+
+        const user = await usersCollection.findOne({ email: email });
+        if (!user) {
+            return res.status(403).json({ message: "Forbidden: User not found" });
+        }
+
+        if (user.role !== "admin") {
+            return res.status(403).json({ message: "Forbidden: Admins only" });
+        }
+
+        next();
+    } catch (err) {
+        console.error("verifyAdmin error:", err);
+        return res.status(500).json({ message: "Internal server error" });
+    }
+};
+
+
 // ----------------- MongoDB Setup -----------------
 async function startServer() {
     try {
@@ -290,6 +339,21 @@ async function startServer() {
             }
         });
 
+        // Get user role by email
+        app.get("/users/role", verifyToken, async (req, res) => {
+            const email = req.query.email;
+            if (!email) return res.status(400).json({ message: "Email is required" });
+
+            try {
+                const user = await usersCollection.findOne({ email });
+                if (!user) return res.status(404).json({ message: "User not found" });
+
+                res.json({ role: user.role || "user" });
+            } catch (err) {
+                console.error("Error fetching user role:", err);
+                res.status(500).json({ message: "Failed to fetch user role" });
+            }
+        });
 
 
 
@@ -301,6 +365,8 @@ async function startServer() {
                 return res.status(400).json({ message: "Missing required fields" });
             }
             if (req.user.email !== announcement.authorEmail) {
+                console.log(req.user.email);
+                console.log(announcement.authorEmail);
                 return res.status(403).json({ message: "Forbidden: Cannot announce as another user" });
             }
             const newAnnouncement = {
@@ -321,7 +387,7 @@ async function startServer() {
         });
 
         // GET all announcements
-        app.get("/announcements", async (req, res) => {
+        app.get("/announcements", verifyToken, verifyAdmin, async (req, res) => {
             try {
                 const announcements = await announcementsCollection
                     .find({})
